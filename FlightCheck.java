@@ -1,0 +1,95 @@
+
+package anticheat;
+
+import org.bukkit.GameMode;
+import org.bukkit.Location;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.Listener;
+import org.bukkit.event.player.PlayerMoveEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.potion.PotionEffectType;
+
+import java.util.HashMap;
+import java.util.Map;
+import java.util.UUID;
+
+public class FlightCheck implements Listener {
+
+    private final AntiCheatPlugin plugin;
+    private final Map<UUID, Integer> airTicks = new HashMap<>();
+    private final Map<UUID, Double> violations = new HashMap<>();
+
+    public FlightCheck(AntiCheatPlugin plugin) { this.plugin = plugin; }
+
+    @EventHandler
+    public void onMove(PlayerMoveEvent e) {
+        Player p = e.getPlayer();
+        Location from = e.getFrom(), to = e.getTo();
+        if (to == null) return;
+
+        // Ignore head rotation
+        if (from.getX() == to.getX() && from.getY() == to.getY() && from.getZ() == to.getZ()) return;
+
+        if (isExempt(p)) { airTicks.remove(p.getUniqueId()); return; }
+
+        UUID id = p.getUniqueId();
+
+        // Reset if game supported
+        if (p.isOnGround() || isNearClimbableOrLiquid(p)) {
+            airTicks.put(id, 0);
+            decay(id);
+            return;
+        }
+
+        int ticks = airTicks.merge(id, 1, Integer::sum);
+        double dy = to.getY() - from.getY();
+
+        // after ~1 tick of rising, vertical movement can't stay near zero
+        // or positive for long without a jump. Tune thresholds while testing.
+        boolean hovering = ticks > 10 && Math.abs(dy) < 0.03;
+        boolean risingTooLong = ticks > 12 && dy > 0.0;
+
+        if (hovering || risingTooLong) {
+            flag(p, hovering ? "hover" : "ascend", dy);
+        }
+    }
+
+    private boolean isExempt(Player p) {
+        return p.getGameMode() == GameMode.CREATIVE
+                || p.getGameMode() == GameMode.SPECTATOR
+                || p.getAllowFlight()
+                || p.isGliding()                       // elytra
+                || p.isInsideVehicle()
+                || p.hasPotionEffect(PotionEffectType.LEVITATION)
+                || p.hasPotionEffect(PotionEffectType.SLOW_FALLING)
+                || p.hasPermission("simpleac.bypass");
+    }
+
+    private boolean isNearClimbableOrLiquid(Player p) {
+        var block = p.getLocation().getBlock();
+        return block.isLiquid() || p.isClimbing() || block.getType().name().contains("COBWEB")
+                || block.getType().name().contains("SCAFFOLDING");
+    }
+
+    private void flag(Player p, String type, double dy) {
+        double vl = violations.merge(p.getUniqueId(), 1.0, Double::sum);
+        plugin.getLogger().warning(p.getName() + " failed Flight (" + type + ") dy=" + dy + " VL=" + vl);
+
+        // Setback: teleport to last safe ground location
+        if (vl >= 5) {
+            p.teleport(p.getLocation().getWorld().getHighestBlockAt(p.getLocation()).getLocation().add(0.5, 1, 0.5));
+            violations.put(p.getUniqueId(), 0.0);
+        }
+    }
+
+    private void decay(UUID id) {
+        violations.computeIfPresent(id, (k, v) -> Math.max(0, v - 0.25));
+    }
+
+    @EventHandler
+    public void onQuit(PlayerQuitEvent e) {
+        airTicks.remove(e.getPlayer().getUniqueId());
+        violations.remove(e.getPlayer().getUniqueId());
+    }
+}
